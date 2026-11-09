@@ -376,3 +376,76 @@ def test_init_force_keeps_recovered_markers(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert IntegrationManifest.load("codex", project).is_recovered(rel)
+
+
+def _create_test_extension(source_dir: Path, ext_id: str = "test-ext") -> Path:
+    """Build a minimal installable extension directory (one command)."""
+    ext_dir = source_dir / ext_id
+    (ext_dir / "commands").mkdir(parents=True)
+    (ext_dir / "extension.yml").write_text(
+        "schema_version: '1.0'\n"
+        "extension: {id: test-ext, name: Test Extension, version: 1.0.0,"
+        " description: A test extension}\n"
+        "requires: {speckit_version: '>=0.1.0'}\n"
+        "provides:\n"
+        "  commands:\n"
+        "  - {name: speckit.test-ext.hello, file: commands/hello.md,"
+        " description: Test hello command}\n",
+        encoding="utf-8",
+    )
+    (ext_dir / "commands" / "hello.md").write_text(
+        "---\ndescription: \"Test hello command\"\n---\n\n# Hello Command\n\n"
+        "Run this to say hello.\n$ARGUMENTS\n",
+        encoding="utf-8",
+    )
+    return ext_dir
+
+
+def test_init_force_registers_extensions_as_skills(tmp_path, monkeypatch):
+    """Regression for #5321: a skills-mode `init --force` must not write
+    command-mode agent files for already-installed extensions.
+
+    The force re-registration ran before init-options.json was saved, so the
+    saved `ai_skills` flag did not exist yet and registration fell back to
+    command mode.
+    """
+    from specify_cli.extensions import ExtensionManager
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, [
+        "init", "proj", "--integration", "copilot",
+        "--integration-options", "--skills",
+        "--ignore-agent-tools", "--non-interactive", "--offline",
+    ])
+    assert result.exit_code == 0, _strip(result.output)
+    project = tmp_path / "proj"
+
+    ext_source = _create_test_extension(tmp_path / "ext-src")
+    manager = ExtensionManager(project)
+    manager.install_from_directory(ext_source, "1.0.0", register_commands=False)
+
+    # Install alone must not write command-mode files for the extension;
+    # only the force re-init below may register it.
+    agents_dir = project / ".github" / "agents"
+    command_files = list(agents_dir.glob("*.agent.md")) if agents_dir.is_dir() else []
+    assert not [p for p in command_files if "test-ext" in p.name], command_files
+
+    options_path = project / ".specify" / "init-options.json"
+    assert options_path.is_file()
+    options_path.unlink()
+
+    monkeypatch.chdir(project)
+    result = CliRunner().invoke(app, [
+        "init", "--here", "--force", "--integration", "copilot",
+        "--integration-options", "--skills",
+        "--ignore-agent-tools", "--non-interactive", "--offline",
+    ])
+    assert result.exit_code == 0, _strip(result.output)
+
+    options = json.loads(options_path.read_text(encoding="utf-8"))
+    assert options.get("ai") == "copilot"
+    assert options.get("ai_skills") is True
+    assert (project / ".github" / "skills" / "speckit-test-ext-hello" / "SKILL.md").is_file()
+    agents_dir = project / ".github" / "agents"
+    command_files = list(agents_dir.glob("*.agent.md")) if agents_dir.is_dir() else []
+    assert not [p for p in command_files if "test-ext" in p.name], command_files
