@@ -1614,6 +1614,150 @@ class TestCommandRunner:
         code = resolve_and_run_event_command("speckit.test", "session_start", "{}", tmp_path)
         assert code == 0
 
+    def test_slow_handler_timeout_exits_1_not_2(self, tmp_path, capsys):
+        """A handler that runs past its timeout must exit 1, not 2.
+
+        Agents read exit code 2 from a Stop hook as "don't stop, keep
+        going", so a slow handler exiting 2 blocks the turn it was meant
+        to end. The timeout is still reported on stderr.
+        """
+        cmd_dir = tmp_path / ".specify" / "templates" / "commands"
+        cmd_dir.mkdir(parents=True)
+        (cmd_dir / "slow.md").write_text(
+            "---\n"
+            "description: \"Slow\"\n"
+            "scripts:\n"
+            "  sh: scripts/slow.sh\n"
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+
+        script_dir = tmp_path / ".specify" / "scripts"
+        script_dir.mkdir(parents=True)
+        script_file = script_dir / "slow.sh"
+        script_file.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+        script_file.chmod(0o755)
+
+        # Skip on Windows because sh is POSIX
+        if platform.system().lower().startswith("win"):
+            return
+
+        code = resolve_and_run_event_command(
+            "speckit.slow", "stop", "{}", tmp_path, timeout=1
+        )
+        assert code == 1
+        assert "timed out" in capsys.readouterr().err
+
+    def test_handler_receives_event_name_via_speckit_event(self, tmp_path):
+        """The handler sees which canonical event fired via SPECKIT_EVENT,
+        so one script can serve several events."""
+        cmd_dir = tmp_path / ".specify" / "templates" / "commands"
+        cmd_dir.mkdir(parents=True)
+        (cmd_dir / "evt.md").write_text(
+            "---\n"
+            "description: \"Evt\"\n"
+            "scripts:\n"
+            "  sh: scripts/evt.sh\n"
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+
+        script_dir = tmp_path / ".specify" / "scripts"
+        script_dir.mkdir(parents=True)
+        script_file = script_dir / "evt.sh"
+        script_file.write_text(
+            "#!/bin/sh\necho \"$SPECKIT_EVENT\" > seen.txt\n", encoding="utf-8"
+        )
+        script_file.chmod(0o755)
+
+        # Skip on Windows because sh is POSIX
+        if platform.system().lower().startswith("win"):
+            return
+
+        code = resolve_and_run_event_command(
+            "speckit.evt", "stop", "{}", tmp_path
+        )
+        assert code == 0
+        assert (tmp_path / "seen.txt").read_text(encoding="utf-8").strip() == "stop"
+
+    def test_inline_runner_timeout_exits_1_not_2(self, tmp_path, capsys):
+        """The stdlib fallback runner (generated dispatcher, no specify_cli
+        importable) mirrors the main runner: a timed-out handler exits 1."""
+        from specify_cli.events import _EVENTS_DISPATCHER_TEMPLATE
+
+        ns: dict = {}
+        exec(_EVENTS_DISPATCHER_TEMPLATE, ns)
+        _run_inline = ns["_run_inline"]
+
+        cmd_dir = tmp_path / ".specify" / "templates" / "commands"
+        cmd_dir.mkdir(parents=True)
+        (cmd_dir / "slow.md").write_text(
+            "---\n"
+            "description: \"Slow\"\n"
+            "scripts:\n"
+            "  sh: scripts/slow.sh\n"
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+
+        script_dir = tmp_path / ".specify" / "scripts"
+        script_dir.mkdir(parents=True)
+        script_file = script_dir / "slow.sh"
+        script_file.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+        script_file.chmod(0o755)
+
+        # Skip on Windows because sh is POSIX
+        if platform.system().lower().startswith("win"):
+            return
+
+        code = _run_inline(
+            "speckit.slow", "{}", tmp_path, 1, event_name="stop"
+        )
+        assert code == 1
+        assert "timed out" in capsys.readouterr().err
+
+    def test_inline_runner_passes_event_name_via_speckit_event(self, tmp_path):
+        """The stdlib fallback runner also tells the handler which event
+        fired via SPECKIT_EVENT."""
+        from specify_cli.events import _EVENTS_DISPATCHER_TEMPLATE
+
+        ns: dict = {}
+        exec(_EVENTS_DISPATCHER_TEMPLATE, ns)
+        _run_inline = ns["_run_inline"]
+
+        cmd_dir = tmp_path / ".specify" / "templates" / "commands"
+        cmd_dir.mkdir(parents=True)
+        (cmd_dir / "evt.md").write_text(
+            "---\n"
+            "description: \"Evt\"\n"
+            "scripts:\n"
+            "  sh: scripts/evt.sh\n"
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+
+        script_dir = tmp_path / ".specify" / "scripts"
+        script_dir.mkdir(parents=True)
+        script_file = script_dir / "evt.sh"
+        script_file.write_text(
+            "#!/bin/sh\necho \"$SPECKIT_EVENT\" > seen.txt\n", encoding="utf-8"
+        )
+        script_file.chmod(0o755)
+
+        # Skip on Windows because sh is POSIX
+        if platform.system().lower().startswith("win"):
+            return
+
+        code = _run_inline(
+            "speckit.evt", "{}", tmp_path, 120, event_name="stop"
+        )
+        assert code == 0
+        assert (tmp_path / "seen.txt").read_text(encoding="utf-8").strip() == "stop"
+
     def test_py_variant_anchored_under_specify(self, tmp_path):
         """S2: the py variant resolves scripts/... under .specify/, not the
         project root, and prepends the resolved interpreter."""

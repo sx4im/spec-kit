@@ -289,7 +289,7 @@ def _resolve_argv(template_path, project_root, ext_id):
     return [str(script_abs), *rest]
 
 
-def _run_inline(command_name, payload, project_root, timeout, envelope="plain", native_event=""):
+def _run_inline(command_name, payload, project_root, timeout, envelope="plain", native_event="", event_name=""):
     """Resolve and run the event command with stdlib only (no specify_cli)."""
     template_path, ext_id = _find_command_template(command_name, project_root)
     if not template_path:
@@ -304,6 +304,11 @@ def _run_inline(command_name, payload, project_root, timeout, envelope="plain", 
         # Windows that is commonly the ANSI codepage, not UTF-8, so a non-ASCII
         # payload (e.g. ``é``) would reach the handler as the wrong bytes.
         # Pin both directions to utf-8 so decode and re-encode agree.
+        # The handler is told which canonical event fired (e.g. "stop") via
+        # SPECKIT_EVENT so one script can serve several events.
+        env = dict(os.environ)
+        if event_name:
+            env["SPECKIT_EVENT"] = event_name
         result = subprocess.run(
             argv,
             input=payload,
@@ -312,6 +317,7 @@ def _run_inline(command_name, payload, project_root, timeout, envelope="plain", 
             encoding="utf-8",
             timeout=timeout,
             cwd=str(project_root),
+            env=env,
         )
         if result.stdout:
             _emit(result.stdout, envelope, native_event)
@@ -320,12 +326,17 @@ def _run_inline(command_name, payload, project_root, timeout, envelope="plain", 
                 sys.stderr.write(result.stderr)
             return result.returncode
         return 0
+    # A runner-side failure must never exit 2: agents read exit code 2 from
+    # a Stop hook as "don't stop, keep going", so a slow or crashing handler
+    # would block the turn it was meant to end. Exit 1 still surfaces the
+    # failure without blocking. A handler's own exit code passes through
+    # untouched above, so a script that deliberately exits 2 keeps its meaning.
     except subprocess.TimeoutExpired:
         print(f"Event {command_name} timed out", file=sys.stderr)
-        return 2
+        return 1
     except Exception as e:
         print(f"Event {command_name} error: {e}", file=sys.stderr)
-        return 2
+        return 1
 
 
 def _emit(output, envelope, native_event=""):
@@ -379,8 +390,9 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(0)
     command_name = sys.argv[1]
-    # event_name is accepted for argv-compat with the native hook command but
-    # is not needed for resolution (the command template drives everything).
+    # event_name is the canonical event (e.g. "stop"). It is not needed for
+    # resolution (the command template drives everything) but is passed to
+    # the handler as SPECKIT_EVENT so the script can tell which event fired.
     _event_name = sys.argv[2]
     # Optional 4th arg: per-handler timeout in seconds (S4).
     timeout = 120
@@ -438,7 +450,7 @@ def main():
         pass
 
     # Fallback: self-contained stdlib resolver (one-time/temporary installs).
-    sys.exit(_run_inline(command_name, payload, project_root, timeout, envelope, native_event))
+    sys.exit(_run_inline(command_name, payload, project_root, timeout, envelope, native_event, event_name=_event_name))
 
 
 if __name__ == "__main__":
@@ -788,6 +800,13 @@ def resolve_and_run_event_command(
     required inside ``hookSpecificOutput`` by Qwen's hooks spec (and included
     by the Claude Code hooks spec Gemini/Tabnine/Devin derive from). Only
     used when *envelope* is ``hookSpecificOutput``.
+
+    The handler runs with ``SPECKIT_EVENT`` set to the canonical *event_name*
+    (e.g. ``"stop"``) so one script can serve several events. A handler that
+    runs past *timeout* — or that the runner fails to start — exits 1, never
+    2: agents read exit code 2 from a Stop hook as "don't stop, keep going",
+    so a slow handler must not block the turn. The timeout is still reported
+    on stderr. A handler's own exit code passes through untouched.
     """
     template_path, ext_id = _find_command_template(command_name, project_root)
     if not template_path:
@@ -805,6 +824,11 @@ def resolve_and_run_event_command(
         # commonly the ANSI codepage, not UTF-8, so a non-ASCII payload (e.g.
         # ``é``) would reach the handler as the wrong bytes. Pin both
         # directions to utf-8 so decode and re-encode agree.
+        # The handler is told which canonical event fired (e.g. "stop") via
+        # SPECKIT_EVENT so one script can serve several events.
+        env = dict(os.environ)
+        if event_name:
+            env["SPECKIT_EVENT"] = event_name
         result = subprocess.run(
             argv,
             input=payload,
@@ -813,6 +837,7 @@ def resolve_and_run_event_command(
             encoding="utf-8",
             timeout=timeout,
             cwd=str(project_root),
+            env=env,
         )
         if result.stdout:
             _emit_event_stdout(result.stdout, envelope, native_event)
@@ -823,10 +848,10 @@ def resolve_and_run_event_command(
         return 0
     except subprocess.TimeoutExpired:
         sys.stderr.write(f"Event command {command_name} timed out\n")
-        return 2
+        return 1
     except Exception as e:
         sys.stderr.write(f"Event command {command_name} error: {e}\n")
-        return 2
+        return 1
 
 
 def _emit_event_stdout(output: str, envelope: str, native_event: str = "") -> None:
