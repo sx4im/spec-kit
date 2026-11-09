@@ -1614,6 +1614,149 @@ class TestCommandRunner:
         code = resolve_and_run_event_command("speckit.test", "session_start", "{}", tmp_path)
         assert code == 0
 
+    @staticmethod
+    def _write_py_handler(tmp_path, name, body):
+        """Write a py-variant command template + script for *name*."""
+        cmd_dir = tmp_path / ".specify" / "templates" / "commands"
+        cmd_dir.mkdir(parents=True)
+        (cmd_dir / f"{name}.md").write_text(
+            "---\n"
+            f"description: \"{name}\"\n"
+            "scripts:\n"
+            f"  py: scripts/{name}.py\n"
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+        script_dir = tmp_path / ".specify" / "scripts"
+        script_dir.mkdir(parents=True)
+        script = script_dir / f"{name}.py"
+        script.write_text(body, encoding="utf-8")
+        return script
+
+    def test_slow_handler_timeout_does_not_exit_2(self, tmp_path):
+        """A handler that runs past its timeout must not exit 2: agents read
+        exit 2 from a Stop hook as "don't stop, keep going", so one slow
+        script would hold the agent open instead of letting it stop."""
+        self._write_py_handler(tmp_path, "slow", "import time\ntime.sleep(5)\n")
+        code = resolve_and_run_event_command("speckit.slow", "stop", "{}", tmp_path, timeout=1)
+        assert code == 1
+
+    def test_handler_receives_canonical_event_name(self, tmp_path):
+        """A handler must be told which event fired: the canonical event
+        name is passed in the SPECKIT_EVENT environment variable."""
+        out_file = tmp_path / "event.out"
+        self._write_py_handler(
+            tmp_path,
+            "slow",
+            "import os\n"
+            f"open({str(out_file)!r}, 'w').write(os.environ.get('SPECKIT_EVENT', ''))\n",
+        )
+        code = resolve_and_run_event_command("speckit.slow", "stop", "{}", tmp_path)
+        assert code == 0
+        assert out_file.read_text(encoding="utf-8") == "stop"
+
+    def test_handler_deliberate_exit_2_is_preserved(self, tmp_path):
+        """Only runner-side failures change exit code: a handler that
+        deliberately exits 2 to block must still block."""
+        self._write_py_handler(tmp_path, "slow", "import sys\nsys.exit(2)\n")
+        code = resolve_and_run_event_command("speckit.slow", "stop", "{}", tmp_path)
+        assert code == 2
+
+    def test_dispatcher_slow_handler_timeout_does_not_exit_2(self, tmp_path):
+        """Template fallback (_run_inline) mirrors the module runner: a
+        handler past its timeout must exit 1, not 2, or a Stop hook blocks."""
+        import subprocess as _sp
+        import sys as _sys
+
+        integration = ClaudeIntegration()
+        manifest = MagicMock(spec=IntegrationManifest)
+        manifest.files = {}
+        manifest.record_file = MagicMock()
+        manifest.record_existing = MagicMock()
+        install_integration_events(
+            integration, tmp_path, manifest,
+            {"stop": [{"command": "speckit.slow"}]},
+        )
+        dispatcher = tmp_path / EVENTS_DISPATCHER_REL
+
+        self._write_py_handler(tmp_path, "slow", "import time\ntime.sleep(5)\n")
+
+        fake_dir = tmp_path / "_stale_pkg"
+        pkg = fake_dir / "specify_cli"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "events.py").write_text(
+            "def resolve_and_run_event_command(*_a, **_k):\n"
+            "    raise AssertionError('delegated path must not run')\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(fake_dir)
+
+        result = _sp.run(
+            [_sys.executable, str(dispatcher), "speckit.slow", "stop", "1"],
+            input="{}",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            cwd=str(tmp_path),
+            check=False,
+        )
+        assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        assert "timed out" in result.stderr
+
+    def test_dispatcher_passes_event_name_to_handler(self, tmp_path):
+        """Template fallback (_run_inline) mirrors the module runner: the
+        handler sees the canonical event name in SPECKIT_EVENT."""
+        import subprocess as _sp
+        import sys as _sys
+
+        integration = ClaudeIntegration()
+        manifest = MagicMock(spec=IntegrationManifest)
+        manifest.files = {}
+        manifest.record_file = MagicMock()
+        manifest.record_existing = MagicMock()
+        install_integration_events(
+            integration, tmp_path, manifest,
+            {"stop": [{"command": "speckit.slow"}]},
+        )
+        dispatcher = tmp_path / EVENTS_DISPATCHER_REL
+
+        out_file = tmp_path / "event.out"
+        self._write_py_handler(
+            tmp_path,
+            "slow",
+            "import os\n"
+            f"open({str(out_file)!r}, 'w').write(os.environ.get('SPECKIT_EVENT', ''))\n",
+        )
+
+        fake_dir = tmp_path / "_stale_pkg"
+        pkg = fake_dir / "specify_cli"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "events.py").write_text(
+            "def resolve_and_run_event_command(*_a, **_k):\n"
+            "    raise AssertionError('delegated path must not run')\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(fake_dir)
+
+        result = _sp.run(
+            [_sys.executable, str(dispatcher), "speckit.slow", "stop", "60"],
+            input="{}",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            cwd=str(tmp_path),
+            check=False,
+        )
+        assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        assert out_file.read_text(encoding="utf-8") == "stop"
+
     def test_py_variant_anchored_under_specify(self, tmp_path):
         """S2: the py variant resolves scripts/... under .specify/, not the
         project root, and prepends the resolved interpreter."""
