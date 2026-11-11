@@ -3369,6 +3369,37 @@ class TestExtensionSkillUnregistration:
         assert not (skills_dir / "speckit-test-ext-hello").exists()
         assert not (skills_dir / "speckit-test-ext-world").exists()
 
+    def test_remove_preserves_user_files_in_skill_directory(
+        self, skills_project, extension_dir
+    ):
+        """Removing an extension must not delete user files in a skill dir.
+
+        Only the extension-owned SKILL.md is removed; the directory itself
+        is removed only when empty, so files the user added afterwards
+        survive removal. Regression guard for #5381 (the supplemental
+        branch removed the whole directory with shutil.rmtree).
+        """
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            extension_dir, "0.1.0", register_commands=False
+        )
+
+        skill_dir = skills_dir / "speckit-test-ext-hello"
+        assert (skill_dir / "SKILL.md").is_file()
+        notes = skill_dir / "my-notes.md"
+        notes.write_text("personal notes\n", encoding="utf-8")
+
+        result = manager.remove(manifest.id, keep_config=False)
+        assert result is True
+
+        # The extension-owned SKILL.md is gone...
+        assert not (skill_dir / "SKILL.md").exists()
+        # ...but the user-authored file survives, so the directory stays.
+        assert notes.is_file()
+        assert notes.read_text(encoding="utf-8") == "personal notes\n"
+        assert skill_dir.is_dir()
+
     def test_skills_removed_when_description_contains_dashes(
         self, skills_project, temp_dir
     ):

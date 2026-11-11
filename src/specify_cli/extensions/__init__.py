@@ -2192,7 +2192,7 @@ class ExtensionManager:
                 every configured agent's skills directory is scanned
                 instead of resolving just the currently active one.
         """
-        from ..integrations._file_changes import changing_file, unlink
+        from ..integrations._file_changes import unlink, unlink_in_directory
 
         generic_roots = {
             Path(path).parent.parent
@@ -2226,8 +2226,18 @@ class ExtensionManager:
                     except OSError:
                         pass
                     continue
-            with changing_file(skill_subdir, removal=True):
-                shutil.rmtree(skill_subdir)
+            # Remove only the extension-owned SKILL.md; the directory is
+            # removed only when empty, so files the user added to the skill
+            # directory survive removal (#5381). The generic branch above
+            # already behaves this way; _register_extension_skills only
+            # ever writes SKILL.md into the directory, so nothing else
+            # here belongs to the extension.
+            unlink_in_directory(
+                skill_file,
+                root=self.project_root
+                if skill_file.is_relative_to(self.project_root)
+                else skill_subdir.parent,
+            )
 
     def _extension_owned_skill_names(
         self, skill_names: List[str], extension_id: str
