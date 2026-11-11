@@ -697,6 +697,68 @@ class TestExtensionSkillRegistration:
         # The pre-existing one should NOT be in registered_skills (it was skipped)
         assert "speckit-test-ext-hello" not in metadata["registered_skills"]
 
+    def test_existing_user_skill_not_overwritten_by_native_registration(
+        self, skills_project, extension_dir
+    ):
+        """Native command registration must not overwrite a user skill (#5380).
+
+        ``test_existing_skill_not_overwritten`` covers the supplemental
+        skills route (``register_commands=False``), which already skips
+        pre-existing skills. With the default ``register_commands=True``
+        the native ``CommandRegistrar`` path overwrote the user's
+        SKILL.md first, and a later ``remove()`` deleted it, so the
+        user's content was lost entirely.
+        """
+        project_dir, skills_dir = skills_project
+
+        # Pre-create a user-authored skill with the same name as an
+        # extension skill, plus an unrelated file in the same directory.
+        user_dir = skills_dir / "speckit-test-ext-hello"
+        user_dir.mkdir(parents=True)
+        (user_dir / "SKILL.md").write_text("user skill", encoding="utf-8")
+        (user_dir / "notes.txt").write_text("user", encoding="utf-8")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(extension_dir, "0.1.0")
+
+        # The user's SKILL.md must survive the install untouched, and the
+        # colliding command must not be recorded as registered.
+        assert (user_dir / "SKILL.md").read_text(encoding="utf-8") == "user skill"
+        metadata = manager.registry.get(manifest.id)
+        assert "speckit.test-ext.hello" not in metadata["registered_commands"].get(
+            "claude", []
+        )
+        # The non-colliding skill should still be created.
+        assert (skills_dir / "speckit-test-ext-world" / "SKILL.md").exists()
+
+        # Removal must not delete content the extension did not create.
+        manager.remove(manifest.id)
+        assert (user_dir / "SKILL.md").read_text(encoding="utf-8") == "user skill"
+        assert (user_dir / "notes.txt").exists()
+
+    def test_remove_preserves_user_replaced_skill(
+        self, skills_project, extension_dir
+    ):
+        """Remove must not delete a skill the user replaced after install (#5380).
+
+        After a normal install the generated SKILL.md carries the
+        extension's ``metadata.source`` marker. If the user replaces the
+        file with their own content (no marker), removing the extension
+        must leave the user's replacement in place.
+        """
+        project_dir, skills_dir = skills_project
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(extension_dir, "0.1.0")
+
+        skill_file = skills_dir / "speckit-test-ext-hello" / "SKILL.md"
+        assert skill_file.exists()
+        skill_file.write_text("my own skill now", encoding="utf-8")
+
+        manager.remove(manifest.id)
+
+        assert skill_file.read_text(encoding="utf-8") == "my own skill now"
+
     def test_existing_skill_directory_without_marker_is_not_modified(
         self, skills_project, extension_dir
     ):

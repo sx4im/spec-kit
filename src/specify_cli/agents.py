@@ -616,6 +616,87 @@ class CommandRegistrar:
         return hashes.get(relative) == hashlib.sha256(path.read_bytes()).hexdigest()
 
     @staticmethod
+    def _extension_owned_skill_file(
+        skill_file: Path,
+        extension_id: str,
+        cmd_file: str,
+        agent_name: str,
+        output_name: str,
+    ) -> bool:
+        """Return True when an existing SKILL.md was written by this extension.
+
+        Ownership is the ``metadata.source`` marker the two skill writers
+        stamp (``<extension-id>:<command file>`` from native registration,
+        ``extension:<extension-id>`` from the supplemental skills route)
+        or a dev-mode symlink to this extension's own rendered cache.
+        Anything else is user content that ``extension add`` must not
+        overwrite (#5380).
+        """
+        if skill_file.is_symlink():
+            try:
+                resolved = skill_file.resolve(strict=False)
+            except OSError:
+                return False
+            # A dev-mode symlink is owned when it points at a rendered cache
+            # of this extension: <ext-dir>/.specify-dev/(agent-commands/<agent>
+            # | extension-skills)/<skill>/SKILL.md, where <ext-dir>'s manifest
+            # declares this extension id. The cache may live in the installed
+            # copy or in the source extension directory being installed from,
+            # so the manifest — not the cache's parent path — is the check.
+            for cache_sub in (
+                Path(".specify-dev") / "agent-commands" / agent_name / output_name / "SKILL.md",
+                Path(".specify-dev") / "extension-skills" / output_name / "SKILL.md",
+            ):
+                if resolved.parts[-len(cache_sub.parts):] != cache_sub.parts:
+                    continue
+                ext_dir = Path(*resolved.parts[: -len(cache_sub.parts)])
+                try:
+                    manifest_data = yaml.safe_load(
+                        (ext_dir / "extension.yml").read_text(encoding="utf-8")
+                    ) or {}
+                    owner = (manifest_data.get("extension") or {}).get("id")
+                except (OSError, UnicodeDecodeError, yaml.YAMLError):
+                    owner = None
+                if owner == extension_id:
+                    return True
+            return False
+        try:
+            raw = skill_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        frontmatter, _ = CommandRegistrar.parse_frontmatter(raw)
+        if not isinstance(frontmatter, dict):
+            return False
+        metadata = frontmatter.get("metadata")
+        source = metadata.get("source", "") if isinstance(metadata, dict) else ""
+        return source in (f"{extension_id}:{cmd_file}", f"extension:{extension_id}")
+
+    @staticmethod
+    def _skill_file_has_source_marker(skill_file: Path) -> bool:
+        """Return True when a SKILL.md carries a spec-kit source marker.
+
+        Removal must never delete content the extension did not create
+        (#5380): a file with no ``metadata.source`` marker was not
+        produced by any skill writer in this codebase, so it is treated
+        as user content and preserved. Unreadable files are preserved
+        too — ownership that cannot be verified is not assumed.
+        """
+        if skill_file.is_symlink():
+            return True
+        try:
+            raw = skill_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        frontmatter, _ = CommandRegistrar.parse_frontmatter(raw)
+        if not isinstance(frontmatter, dict):
+            return False
+        metadata = frontmatter.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        source = metadata.get("source", "")
+        return isinstance(source, str) and bool(source.strip())
+
+    @staticmethod
     def _same_lexical_path(left: Path, right: Path) -> bool:
         """Compare paths after lexical normalization without resolving symlinks."""
         return os.path.normcase(os.path.normpath(os.fspath(left))) == os.path.normcase(
@@ -888,6 +969,28 @@ class CommandRegistrar:
             if agent_name == "generic" and (dest_file.exists() or dest_file.is_symlink()):
                 if not self._generic_owned_output(dest_file, source_id, project_root):
                     continue
+            if (
+                extension_id
+                and agent_config["extension"] == "/SKILL.md"
+                and (dest_file.exists() or dest_file.is_symlink())
+                and not self._extension_owned_skill_file(
+                    dest_file, extension_id, cmd_file, agent_name, output_name
+                )
+            ):
+                # Never silently overwrite a pre-existing user skill (#5380).
+                # A file this extension wrote (its metadata.source marker or
+                # a dev-mode symlink to its own cache) may be refreshed;
+                # anything else is user content: skip it with a warning so
+                # a later remove() never deletes what the extension did not
+                # create. Skipped commands are not recorded as registered.
+                import warnings
+
+                warnings.warn(
+                    f"Skipping command '{cmd_name}': skill '{output_name}' already "
+                    f"exists and was not created by extension '{extension_id}'.",
+                    stacklevel=2,
+                )
+                continue
             dest_file.parent.mkdir(parents=True, exist_ok=True)
             self._write_registered_output(
                 dest_file,
@@ -973,6 +1076,23 @@ class CommandRegistrar:
                 if agent_name == "generic" and (alias_file.exists() or alias_file.is_symlink()):
                     if not self._generic_owned_output(alias_file, source_id, project_root):
                         continue
+                if (
+                    extension_id
+                    and agent_config["extension"] == "/SKILL.md"
+                    and (alias_file.exists() or alias_file.is_symlink())
+                    and not self._extension_owned_skill_file(
+                        alias_file, extension_id, cmd_file, agent_name, alias_output_name
+                    )
+                ):
+                    # Same ownership guard as the primary command above (#5380).
+                    import warnings
+
+                    warnings.warn(
+                        f"Skipping command '{alias}': skill '{alias_output_name}' already "
+                        f"exists and was not created by extension '{extension_id}'.",
+                        stacklevel=2,
+                    )
+                    continue
                 alias_file.parent.mkdir(parents=True, exist_ok=True)
                 self._write_registered_output(
                     alias_file,
@@ -1395,6 +1515,15 @@ class CommandRegistrar:
                         except ValueError:
                             continue
                         if cmd_file.exists() or cmd_file.is_symlink():
+                            if agent_config["extension"] == "/SKILL.md" and not (
+                                self._skill_file_has_source_marker(cmd_file)
+                            ):
+                                # Never delete a skill the extension did not
+                                # create (#5380): a SKILL.md with no
+                                # metadata.source marker is user content (e.g.
+                                # replaced by the user after install), so
+                                # leave it in place.
+                                continue
                             from .integrations._file_changes import after_file_change, before_file_change
 
                             before_file_change(cmd_file, removal=True)

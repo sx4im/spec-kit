@@ -3911,9 +3911,17 @@ Real body starts here.
         """Codex skill cleanup should use the same mapped names as registration."""
         skills_dir = project_dir / ".agents" / "skills"
         (skills_dir / "speckit-specify").mkdir(parents=True)
-        (skills_dir / "speckit-specify" / "SKILL.md").write_text("body")
+        # Real registered skills always carry a metadata.source marker;
+        # marker-less files are treated as user content and preserved (#5380).
+        (skills_dir / "speckit-specify" / "SKILL.md").write_text(
+            "---\nname: speckit-specify\ndescription: d\n"
+            "metadata:\n  source: test:commands/specify.md\n---\nbody"
+        )
         (skills_dir / "speckit-shortcut").mkdir(parents=True)
-        (skills_dir / "speckit-shortcut" / "SKILL.md").write_text("body")
+        (skills_dir / "speckit-shortcut" / "SKILL.md").write_text(
+            "---\nname: speckit-shortcut\ndescription: d\n"
+            "metadata:\n  source: test:commands/shortcut.md\n---\nbody"
+        )
 
         registrar = CommandRegistrar()
         registrar.unregister_commands(
