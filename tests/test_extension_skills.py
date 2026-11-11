@@ -3369,6 +3369,73 @@ class TestExtensionSkillUnregistration:
         assert not (skills_dir / "speckit-test-ext-hello").exists()
         assert not (skills_dir / "speckit-test-ext-world").exists()
 
+    def test_remove_preserves_user_files_in_skill_directory(
+        self, skills_project, extension_dir
+    ):
+        """Removing an extension must not delete user files in a skill directory.
+
+        Only the extension-owned SKILL.md is removed; the directory is
+        removed only when empty, so files the user added (notes, extra
+        references) survive ``extension remove``. Regression guard for #5381.
+        """
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            extension_dir, "0.1.0", register_commands=False
+        )
+
+        skill_dir = skills_dir / "speckit-test-ext-hello"
+        assert (skill_dir / "SKILL.md").exists()
+        notes = skill_dir / "my-notes.md"
+        notes.write_text("personal notes\n", encoding="utf-8")
+
+        result = manager.remove(manifest.id, keep_config=False)
+        assert result is True
+
+        # The extension's own SKILL.md is gone, but the user file survives
+        # together with its directory.
+        assert not (skill_dir / "SKILL.md").exists()
+        assert notes.read_text(encoding="utf-8") == "personal notes\n"
+        assert skill_dir.is_dir()
+
+        # A skill directory without user files is still removed entirely.
+        assert not (skills_dir / "speckit-test-ext-world").exists()
+
+    def test_reinstall_after_remove_recreates_skill_with_user_files_preserved(
+        self, skills_project, extension_dir
+    ):
+        """A forced reinstall must re-create SKILL.md in a surviving directory.
+
+        After ``extension remove`` leaves a skill directory behind because it
+        still holds user files, reinstalling the extension (the
+        ``extension update`` path) must write the fresh SKILL.md back into
+        that directory instead of skipping it as a pre-existing user
+        directory. Regression guard for #5381.
+        """
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            extension_dir, "0.1.0", register_commands=False
+        )
+
+        skill_dir = skills_dir / "speckit-test-ext-hello"
+        notes = skill_dir / "my-notes.md"
+        notes.write_text("personal notes\n", encoding="utf-8")
+
+        assert manager.remove(manifest.id, keep_config=False) is True
+        assert skill_dir.is_dir()
+        assert not (skill_dir / "SKILL.md").exists()
+
+        manifest = manager.install_from_directory(
+            extension_dir, "0.1.0", register_commands=False, force=True
+        )
+
+        assert (skill_dir / "SKILL.md").is_file()
+        assert "speckit-test-ext-hello" in manager.registry.get(manifest.id)[
+            "registered_skills"
+        ]
+        assert notes.read_text(encoding="utf-8") == "personal notes\n"
+
     def test_skills_removed_when_description_contains_dashes(
         self, skills_project, temp_dir
     ):

@@ -2176,6 +2176,10 @@ class ExtensionManager:
         Called during extension removal to clean up skill files that
         were created by ``_register_extension_skills()``.
 
+        Only the extension-owned ``SKILL.md`` is removed; the skill
+        directory itself is removed only when nothing is left in it, so
+        files the user added to the directory survive removal (#5381).
+
         When *skills_dir* is omitted, project-local agent skill directories
         are scanned. Home-scoped outputs require explicit agent provenance:
         the legacy flat registry and ``metadata.source`` marker do not
@@ -2192,7 +2196,7 @@ class ExtensionManager:
                 every configured agent's skills directory is scanned
                 instead of resolving just the currently active one.
         """
-        from ..integrations._file_changes import changing_file, unlink
+        from ..integrations._file_changes import unlink, unlink_in_directory
 
         generic_roots = {
             Path(path).parent.parent
@@ -2226,8 +2230,18 @@ class ExtensionManager:
                     except OSError:
                         pass
                     continue
-            with changing_file(skill_subdir, removal=True):
-                shutil.rmtree(skill_subdir)
+            # Remove only the extension-owned SKILL.md and drop the directory
+            # when nothing is left in it. Files the user added to the skill
+            # directory (notes, extra references) must survive removal (#5381);
+            # a whole-directory rmtree would delete them with it.
+            unlink_in_directory(
+                skill_file,
+                root=(
+                    self.project_root
+                    if skill_file.is_relative_to(self.project_root)
+                    else skill_subdir.parent
+                ),
+            )
 
     def _extension_owned_skill_names(
         self, skill_names: List[str], extension_id: str
@@ -3060,8 +3074,12 @@ class ExtensionManager:
 
             # Auto-register extension commands as agent skills when skills mode
             # was used during project initialisation (feature parity).
+            # Pass force through so a forced reinstall re-creates SKILL.md in a
+            # skill directory that removal left behind because it still holds
+            # user files (#5381); without it the skill would be silently
+            # skipped as a pre-existing user directory.
             registered_skills = self._register_extension_skills(
-                manifest, dest_dir, link_outputs=link_commands
+                manifest, dest_dir, link_outputs=link_commands, force=force
             )
             if register_commands and generic_active and manifest.commands:
                 expected = set(names)

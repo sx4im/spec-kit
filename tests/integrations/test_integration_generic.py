@@ -1407,11 +1407,13 @@ def test_generic_extension_update_uses_project_registrar(
             if file.is_file():
                 zip_file.write(file, file.relative_to(updated_source))
 
-    def install_update(self, _zip_path, speckit_version, *, catalog_name=None):
+    def install_update(
+        self, _zip_path, speckit_version, force=False, *, catalog_name=None
+    ):
         if fail_install:
             raise RuntimeError("simulated update failure")
         return self.install_from_directory(
-            updated_source, speckit_version, catalog_name=catalog_name
+            updated_source, speckit_version, force=force, catalog_name=catalog_name
         )
 
     with (
@@ -1601,11 +1603,13 @@ def test_generic_update_rollback_restores_previous_output_directory(
             if file.is_file():
                 zip_file.write(file, file.relative_to(updated_source))
 
-    def install_update(self, _zip_path, speckit_version, *, catalog_name=None):
+    def install_update(
+        self, _zip_path, speckit_version, force=False, *, catalog_name=None
+    ):
         if fail_install:
             raise RuntimeError("simulated update failure")
         return self.install_from_directory(
-            updated_source, speckit_version, catalog_name=catalog_name
+            updated_source, speckit_version, force=force, catalog_name=catalog_name
         )
 
     fail_install = True

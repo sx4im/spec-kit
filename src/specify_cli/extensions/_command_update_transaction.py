@@ -550,10 +550,15 @@ def run_update_command(extension: str | None) -> None:
                     installation_modified = True
                     manager.remove(extension_id, keep_config=True)
 
-                    # 8. Install new version
+                    # 8. Install new version. Force the install so skill
+                    # re-registration overwrites SKILL.md in a skill directory
+                    # that removal left behind because it still holds user
+                    # files (#5381); the extension was already removed above,
+                    # so the force flag only affects skill registration.
                     _ = manager.install_from_zip(
                         archive_path,
                         speckit_version,
+                        force=True,
                         catalog_name=update.catalog_name,
                     )
 
