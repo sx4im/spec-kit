@@ -697,6 +697,128 @@ class TestExtensionSkillRegistration:
         # The pre-existing one should NOT be in registered_skills (it was skipped)
         assert "speckit-test-ext-hello" not in metadata["registered_skills"]
 
+    def test_native_registration_skips_preexisting_user_skill(
+        self, skills_project, extension_dir
+    ):
+        """Native registration must not overwrite a pre-existing user SKILL.md (#5380).
+
+        Unlike test_existing_skill_not_overwritten (which installs with
+        register_commands=False), this exercises the default install path:
+        the native ``register_commands`` route is what overwrote user skills.
+        """
+        project_dir, skills_dir = skills_project
+
+        # Pre-create a user-authored skill with the same name as an extension skill
+        custom_dir = skills_dir / "speckit-test-ext-hello"
+        custom_dir.mkdir(parents=True)
+        custom_content = "# My Custom Hello Skill\nUser-modified content\n"
+        (custom_dir / "SKILL.md").write_text(custom_content)
+        (custom_dir / "notes.txt").write_text("user notes")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(extension_dir, "0.1.0")
+
+        # User content is untouched on both routes
+        assert (custom_dir / "SKILL.md").read_text() == custom_content
+        assert (custom_dir / "notes.txt").read_text() == "user notes"
+
+        # The skipped skill is recorded on neither route, so later removal
+        # has nothing to delete; the other skill is still registered.
+        metadata = manager.registry.get(manifest.id)
+        assert metadata["registered_commands"] == {
+            "claude": ["speckit.test-ext.world"]
+        }
+        assert "speckit-test-ext-hello" not in metadata["registered_skills"]
+
+    def test_remove_preserves_preexisting_user_skill(
+        self, skills_project, extension_dir
+    ):
+        """`extension remove` must never delete a pre-existing user SKILL.md (#5380)."""
+        project_dir, skills_dir = skills_project
+
+        custom_dir = skills_dir / "speckit-test-ext-hello"
+        custom_dir.mkdir(parents=True)
+        custom_content = "# My Custom Hello Skill\nUser-modified content\n"
+        (custom_dir / "SKILL.md").write_text(custom_content)
+        (custom_dir / "notes.txt").write_text("user notes")
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(extension_dir, "0.1.0")
+
+        assert manager.remove("test-ext") is True
+
+        assert (custom_dir / "SKILL.md").read_text() == custom_content
+        assert (custom_dir / "notes.txt").exists()
+        # The extension's own skill is still cleaned up.
+        assert not (skills_dir / "speckit-test-ext-world").exists()
+
+    def test_remove_preserves_unowned_skill_even_when_tracked(
+        self, skills_project, extension_dir
+    ):
+        """Remove must not delete an unmarked SKILL.md, even if tracked (#5380).
+
+        Simulates a stale/legacy registry entry that still names a
+        user-authored skill: removal is decided by the file's ownership
+        marker, not by the registry name alone.
+        """
+        project_dir, skills_dir = skills_project
+
+        custom_dir = skills_dir / "speckit-test-ext-hello"
+        custom_dir.mkdir(parents=True)
+        custom_content = "# My Custom Hello Skill\nUser-modified content\n"
+        (custom_dir / "SKILL.md").write_text(custom_content)
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(extension_dir, "0.1.0")
+
+        metadata = manager.registry.get("test-ext")
+        metadata["registered_commands"] = {
+            "claude": ["speckit.test-ext.hello", "speckit.test-ext.world"]
+        }
+        manager.registry.add("test-ext", metadata)
+
+        assert manager.remove("test-ext") is True
+
+        assert (custom_dir / "SKILL.md").read_text() == custom_content
+        assert not (skills_dir / "speckit-test-ext-world").exists()
+
+    def test_reregistration_refreshes_own_skill(
+        self, skills_project, extension_dir
+    ):
+        """Re-registering over the extension's own SKILL.md refreshes it (#5380)."""
+        from specify_cli.agents import CommandRegistrar
+
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(extension_dir, "0.1.0")
+
+        skill_file = skills_dir / "speckit-test-ext-hello" / "SKILL.md"
+        assert "Run this to say hello." in skill_file.read_text(encoding="utf-8")
+        assert "source: test-ext:commands/hello.md" in skill_file.read_text(
+            encoding="utf-8"
+        )
+
+        installed = project_dir / ".specify" / "extensions" / "test-ext"
+        (installed / "commands" / "hello.md").write_text(
+            "---\n"
+            "description: \"Test hello command\"\n"
+            "---\n"
+            "\n"
+            "# Hello Command\n"
+            "\n"
+            "Run this updated hello.\n"
+        )
+        CommandRegistrar(project_dir).register_commands(
+            "claude",
+            manifest.commands,
+            manifest.id,
+            installed,
+            project_dir,
+            extension_id=manifest.id,
+        )
+
+        assert "Run this updated hello." in skill_file.read_text(encoding="utf-8")
+
     def test_existing_skill_directory_without_marker_is_not_modified(
         self, skills_project, extension_dir
     ):

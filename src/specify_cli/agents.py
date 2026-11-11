@@ -9,6 +9,7 @@ command files into agent-specific directories in the correct format.
 import hashlib
 import os
 import re
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -638,6 +639,98 @@ class CommandRegistrar:
             return None
         return agent
 
+    @staticmethod
+    def _is_extension_dev_cache(path: Path, output_name: str) -> bool:
+        """Return True when *path* is this skill's dev-mode cache file.
+
+        Dev installs render skills into a ``.specify-dev`` cache and link
+        the skill file to it. The cache may live outside the installed
+        extension directory (e.g. the source checkout's cache), so path
+        shape — not containment — identifies it: either the supplemental
+        ``extension-skills/<skill>/SKILL.md`` layout or the native
+        ``agent-commands/<agent>/<skill>/SKILL.md`` layout.
+        """
+        parts = Path(path).parts
+        if ".specify-dev" not in parts:
+            return False
+        rest = parts[parts.index(".specify-dev") + 1 :]
+        if (
+            len(rest) == 3
+            and rest[0] == "extension-skills"
+            and rest[1] == output_name
+            and rest[2] == "SKILL.md"
+        ):
+            return True
+        return (
+            len(rest) == 4
+            and rest[0] == "agent-commands"
+            and rest[2] == output_name
+            and rest[3] == "SKILL.md"
+        )
+
+    @staticmethod
+    def _is_own_skill_output(
+        dest_file: Path,
+        source_id: str,
+        cmd_file: str,
+        source_root: Path,
+        output_name: str,
+    ) -> bool:
+        """Return True when an existing SKILL.md was created by this registration.
+
+        A dev-mode symlink pointing back into the source directory, or at
+        this skill's dev cache, is a refreshable cache link, and a regular
+        file must carry the ``metadata.source`` marker this registration
+        would write (``"<source_id>:<cmd_file>"``). Anything else — a
+        user-authored skill, another source's skill, or an unreadable
+        file — is not ours, so the caller must leave it alone (#5380).
+        """
+        try:
+            if dest_file.is_symlink():
+                resolved = dest_file.resolve()
+                if resolved.is_relative_to(source_root):
+                    return True
+                return CommandRegistrar._is_extension_dev_cache(
+                    resolved, output_name
+                )
+            raw = dest_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, RuntimeError):
+            return False
+        frontmatter, _ = CommandRegistrar.parse_frontmatter(raw)
+        if not isinstance(frontmatter, dict):
+            return False
+        metadata = frontmatter.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        return metadata.get("source") == f"{source_id}:{cmd_file}"
+
+    @staticmethod
+    def _is_extension_owned_skill(skill_file: Path, extension_id: str) -> bool:
+        """Return True when a SKILL.md was created by this extension.
+
+        The native route writes ``metadata.source`` as
+        ``"<extension_id>:<command file>"`` and the supplemental skills
+        route writes ``"extension:<extension_id>"``. Anything else — a
+        user-authored skill, another extension's skill, or an unreadable
+        file — is not ours, so removal must preserve it (#5380).
+        """
+        try:
+            raw = skill_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, RuntimeError):
+            return False
+        frontmatter, _ = CommandRegistrar.parse_frontmatter(raw)
+        if not isinstance(frontmatter, dict):
+            return False
+        metadata = frontmatter.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        source = metadata.get("source")
+        if not isinstance(source, str) or not source:
+            return False
+        return source == f"extension:{extension_id}" or source.startswith(
+            f"{extension_id}:"
+        )
+
     @project_registration
     def register_commands(
         self,
@@ -764,8 +857,6 @@ class CommandRegistrar:
             try:
                 content = source_file.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as exc:
-                import warnings
-
                 warnings.warn(
                     f"Skipping command '{cmd_name}': could not read source file "
                     f"'{cmd_file}' ({exc.__class__.__name__}: {exc}).",
@@ -888,6 +979,26 @@ class CommandRegistrar:
             if agent_name == "generic" and (dest_file.exists() or dest_file.is_symlink()):
                 if not self._generic_owned_output(dest_file, source_id, project_root):
                     continue
+            if (
+                agent_config["extension"] == "/SKILL.md"
+                and (dest_file.exists() or dest_file.is_symlink())
+                and not self._is_own_skill_output(
+                    dest_file, source_id, cmd_file, source_root, output_name
+                )
+            ):
+                # Never overwrite a pre-existing skill this registration did
+                # not create (#5380): a user-authored SKILL.md must survive
+                # `extension add`, and skipping here also keeps it out of
+                # the registered list so `extension remove` leaves it alone.
+                # Our own previous output (matching marker) and dev-mode
+                # cache symlinks are still refreshed.
+                warnings.warn(
+                    f"Skipping skill '{output_name}': '{dest_file}' "
+                    "already exists and was not created by this source; "
+                    "leaving it unchanged.",
+                    stacklevel=2,
+                )
+                continue
             dest_file.parent.mkdir(parents=True, exist_ok=True)
             self._write_registered_output(
                 dest_file,
@@ -973,6 +1084,21 @@ class CommandRegistrar:
                 if agent_name == "generic" and (alias_file.exists() or alias_file.is_symlink()):
                     if not self._generic_owned_output(alias_file, source_id, project_root):
                         continue
+                if (
+                    agent_config["extension"] == "/SKILL.md"
+                    and (alias_file.exists() or alias_file.is_symlink())
+                    and not self._is_own_skill_output(
+                        alias_file, source_id, cmd_file, source_root, alias_output_name
+                    )
+                ):
+                    # Same ownership guard as the primary output (#5380).
+                    warnings.warn(
+                        f"Skipping skill '{alias_output_name}': '{alias_file}' "
+                        "already exists and was not created by this source; "
+                        "leaving it unchanged.",
+                        stacklevel=2,
+                    )
+                    continue
                 alias_file.parent.mkdir(parents=True, exist_ok=True)
                 self._write_registered_output(
                     alias_file,
@@ -1344,7 +1470,10 @@ class CommandRegistrar:
         return results
 
     def unregister_commands(
-        self, registered_commands: Dict[str, List[str]], project_root: Path
+        self,
+        registered_commands: Dict[str, List[str]],
+        project_root: Path,
+        extension_id: str | None = None,
     ) -> None:
         """Remove previously registered command files from agent directories.
 
@@ -1356,6 +1485,11 @@ class CommandRegistrar:
         Args:
             registered_commands: Dict mapping agent names to command name lists
             project_root: Path to project root
+            extension_id: When set, a SKILL.md file is only removed when
+                its ``metadata.source`` marker belongs to this extension;
+                anything else (a user-authored skill, another extension's
+                skill, or an unreadable file) is preserved (#5380). When
+                omitted, removal keeps its historical behavior.
         """
         self._ensure_configs()
         for agent_name, cmd_names in registered_commands.items():
@@ -1395,6 +1529,19 @@ class CommandRegistrar:
                         except ValueError:
                             continue
                         if cmd_file.exists() or cmd_file.is_symlink():
+                            # Never delete a SKILL.md this extension did not
+                            # create (#5380). Generated skills carry a
+                            # metadata.source marker identifying their owner;
+                            # a file without a matching marker is user content
+                            # (or another extension's) and must be preserved.
+                            if (
+                                extension_id is not None
+                                and agent_config["extension"] == "/SKILL.md"
+                                and not self._is_extension_owned_skill(
+                                    cmd_file, extension_id
+                                )
+                            ):
+                                continue
                             from .integrations._file_changes import after_file_change, before_file_change
 
                             before_file_change(cmd_file, removal=True)

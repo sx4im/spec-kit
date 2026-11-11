@@ -3505,7 +3505,7 @@ class ExtensionManager:
                 safe_commands.pop("generic")
             if safe_commands:
                 CommandRegistrar(self.project_root, include_generic=False).unregister_commands(
-                    safe_commands, self.project_root
+                    safe_commands, self.project_root, extension_id=extension_id
                 )
         if metadata:
             self._remove_generic_artifact_paths(extension_id, metadata)
@@ -3724,7 +3724,9 @@ class ExtensionManager:
                     )
                 if command_names:
                     registrar.unregister_commands(
-                        {agent_name: command_names}, self.project_root
+                        {agent_name: command_names},
+                        self.project_root,
+                        extension_id=ext_id,
                     )
 
                 new_registered = copy.deepcopy(registered_commands)
@@ -4168,7 +4170,9 @@ class ExtensionManager:
                                         extension_id=ext_id,
                                     )
                                 registrar.unregister_commands(
-                                    {agent_name: fully_replaced}, self.project_root
+                                    {agent_name: fully_replaced},
+                                    self.project_root,
+                                    extension_id=ext_id,
                                 )
                                 registered_commands = metadata.get(
                                     "registered_commands", {}
@@ -4420,10 +4424,15 @@ class CommandRegistrar:
         )
 
     def unregister_commands(
-        self, registered_commands: Dict[str, List[str]], project_root: Path
+        self,
+        registered_commands: Dict[str, List[str]],
+        project_root: Path,
+        extension_id: str | None = None,
     ) -> None:
         """Remove previously registered command files from agent directories."""
-        self._registrar.unregister_commands(registered_commands, project_root)
+        self._registrar.unregister_commands(
+            registered_commands, project_root, extension_id=extension_id
+        )
 
     def register_commands_for_claude(
         self,
