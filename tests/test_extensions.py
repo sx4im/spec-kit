@@ -2467,9 +2467,11 @@ class TestExtensionManager:
         assert staging_dir.exists()
         assert (staging_dir / ".rescue-complete").exists()
         assert config_file.read_bytes() == original_bytes
-        assert (
-            ext_dir / "test-ext-config.local.yml"
-        ).read_text() == "new_default: true\n"
+        # The failed install rolls its outputs back (#5379): the packaged
+        # live-only config it copied is removed from dest_dir here and is
+        # re-copied from source on retry (verified by the assertions
+        # below); only the rescued user config is kept.
+        assert not (ext_dir / "test-ext-config.local.yml").exists()
 
         manifest = manager.install_from_directory(
             extension_dir, "0.1.0", register_commands=False

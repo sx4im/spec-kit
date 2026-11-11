@@ -1454,6 +1454,52 @@ class ExtensionManager:
 
         return targets
 
+    def _native_install_output_paths(self, manifest: ExtensionManifest) -> List[Path]:
+        """Return every file a native install attempt may write (#5379).
+
+        The union of the skill outputs (``<skills dir>/<skill>/SKILL.md``)
+        and the rendered command outputs (one per agent target directory,
+        including aliases and the Copilot prompt companion). Used to
+        snapshot pre-existing files before registration so a failed
+        install can restore them instead of deleting them.
+        """
+        from ..agents import CommandRegistrar
+
+        names = list(self._collect_manifest_command_names(manifest))
+        paths: List[Path] = []
+
+        skills_dir = self._get_skills_dir(create=False)
+        if skills_dir is not None:
+            for name in names:
+                paths.append(
+                    skills_dir / self._skill_name_for_command(name) / "SKILL.md"
+                )
+
+        registrar = CommandRegistrar(self.project_root)
+        try:
+            targets = self._command_registration_targets()
+        except (OSError, ValueError):
+            # Target resolution can fail for agents whose output directory
+            # cannot be determined (e.g. generic without --commands-dir).
+            # Registration itself skips such agents, so the snapshot simply
+            # has no command outputs to cover for them; the removal
+            # machinery in the rollback still applies.
+            targets = {}
+        for agent_name, commands_dir in targets.items():
+            agent_config = registrar.AGENT_CONFIGS.get(agent_name, {})
+            extension = agent_config.get("extension", "")
+            for name in names:
+                output_name = registrar._compute_output_name(
+                    agent_name, name, agent_config
+                )
+                paths.append(commands_dir / f"{output_name}{extension}")
+                if agent_name == "copilot":
+                    paths.append(
+                        self.project_root / ".github" / "prompts" / f"{name}.prompt.md"
+                    )
+
+        return paths
+
     def _register_commands_for_active_agent(
         self,
         manifest: ExtensionManifest,
@@ -2996,6 +3042,114 @@ class ExtensionManager:
         # the restored user config with packaged defaults.  Cleanup is deferred
         # until after registry.add() succeeds (see post-commit cleanup below).
 
+        def rollback_package() -> None:
+            """Retire the installed package copy, restoring rescued configs.
+
+            Shared by the generic and native rollbacks: a failed install
+            must not leave the copied package behind, but configs rescued
+            from a previous --keep-config removal (or restored from the
+            --force backup) belong to the user and are kept, marked with
+            ``.keep-config`` exactly as remove() leaves them.
+            """
+            if not dest_dir.exists():
+                return
+            preserved = set(stranded_configs)
+            if did_remove:
+                backup_dir = self.extensions_dir / ".backup" / manifest.id
+                if backup_dir.is_dir() and not backup_dir.is_symlink():
+                    for config_file in backup_dir.iterdir():
+                        if (
+                            config_file.is_file()
+                            and not config_file.is_symlink()
+                            and config_file.name.endswith(("-config.yml", "-config.local.yml"))
+                        ):
+                            shutil.copy2(config_file, dest_dir / config_file.name)
+                            preserved.add(config_file.name)
+            if preserved:
+                for child in dest_dir.iterdir():
+                    if child.name in preserved:
+                        continue
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                (dest_dir / ".keep-config").write_text("", encoding="utf-8")
+            else:
+                shutil.rmtree(dest_dir)
+
+        def restore_native_snapshot() -> None:
+            """Restore pre-existing native outputs the attempt overwrote (#5379).
+
+            Best-effort: a file the attempt created (absent before) is
+            removed; a file that existed before is rewritten with its
+            original bytes; a pre-existing symlink is re-created only
+            while its target still exists. Unreadable entries are left
+            alone rather than deleted.
+            """
+            for output_path, (kind, data) in native_snapshot.items():
+                try:
+                    if kind == "absent":
+                        if output_path.is_symlink() or output_path.is_file():
+                            output_path.unlink()
+                        if output_path.name == "SKILL.md":
+                            try:
+                                output_path.parent.rmdir()
+                            except OSError:
+                                pass
+                    elif kind == "file":
+                        current = None
+                        if output_path.is_file() and not output_path.is_symlink():
+                            current = output_path.read_bytes()
+                        if current == data:
+                            continue
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        if output_path.is_symlink() or output_path.is_file():
+                            output_path.unlink()
+                        output_path.write_bytes(data)
+                    elif kind == "symlink":
+                        target = data
+                        if not (output_path.parent / target).exists():
+                            if output_path.is_symlink() or output_path.is_file():
+                                output_path.unlink()
+                            continue
+                        if (
+                            output_path.is_symlink()
+                            and os.readlink(output_path) == target
+                        ):
+                            continue
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        if output_path.is_symlink() or output_path.is_file():
+                            output_path.unlink()
+                        os.symlink(target, output_path)
+                    # "unknown": leave alone.
+                except OSError:
+                    continue
+
+        def rollback_native_registration() -> None:
+            """Roll back a failed native (non-generic) install (#5379).
+
+            Mirrors remove(): unregister rendered command artifacts and
+            marker-verified skill outputs, retire the installed package
+            copy, then restore pre-existing files the attempt overwrote.
+            The package is retired before the restore so a dev-mode
+            symlink whose target lived inside it is not recreated
+            pointing at a deleted cache.
+            """
+            from ..agents import CommandRegistrar
+
+            safe_commands = {
+                agent: names_
+                for agent, names_ in registered_commands.items()
+                if agent != "generic"
+            }
+            if safe_commands:
+                CommandRegistrar(
+                    self.project_root, include_generic=False
+                ).unregister_commands(safe_commands, self.project_root)
+            self._unregister_extension_skills(native_skill_names, manifest.id)
+            rollback_package()
+            restore_native_snapshot()
+
         def rollback_generic_registration() -> None:
             from ..shared_infra import _validate_safe_shared_directory
 
@@ -3024,35 +3178,41 @@ class ExtensionManager:
                     except OSError:
                         pass
 
-            preserved = set(stranded_configs)
-            if did_remove:
-                backup_dir = self.extensions_dir / ".backup" / manifest.id
-                if backup_dir.is_dir() and not backup_dir.is_symlink():
-                    for config_file in backup_dir.iterdir():
-                        if (
-                            config_file.is_file()
-                            and not config_file.is_symlink()
-                            and config_file.name.endswith(("-config.yml", "-config.local.yml"))
-                        ):
-                            shutil.copy2(config_file, dest_dir / config_file.name)
-                            preserved.add(config_file.name)
-            if preserved:
-                for child in dest_dir.iterdir():
-                    if child.name in preserved:
-                        continue
-                    if child.is_dir() and not child.is_symlink():
-                        shutil.rmtree(child)
-                    else:
-                        child.unlink()
-                (dest_dir / ".keep-config").write_text("", encoding="utf-8")
-            else:
-                shutil.rmtree(dest_dir)
+            rollback_package()
+
+        # Outputs the attempt may write, snapshotted before registration so
+        # a failed install can restore pre-existing files instead of
+        # deleting them (#5379). The manifest-derived skill names also
+        # cover a registration call that fails partway and never reports
+        # what it wrote.
+        registered_commands: Dict[str, List[str]] = {}
+        registered_skills: List[str] = []
+        native_skill_names = [
+            self._skill_name_for_command(cmd["name"]) for cmd in manifest.commands
+        ]
+        native_snapshot: Dict[Path, tuple[str, bytes | str | None]] = {}
+        # No commands means neither registration call writes anything
+        # (both return early) — and resolving agent directories here
+        # could raise for integrations whose output directory is not
+        # configured (e.g. generic without --commands-dir), failing an
+        # install that would otherwise succeed.
+        for output_path in (
+            self._native_install_output_paths(manifest) if manifest.commands else []
+        ):
+            try:
+                if output_path.is_symlink():
+                    native_snapshot[output_path] = ("symlink", os.readlink(output_path))
+                elif output_path.is_file():
+                    native_snapshot[output_path] = ("file", output_path.read_bytes())
+                else:
+                    native_snapshot[output_path] = ("absent", None)
+            except OSError:
+                native_snapshot[output_path] = ("unknown", None)
 
         hooks_started = False
         registry_started = False
         try:
             # Register commands with AI agents (active integration only, #2948)
-            registered_commands = {}
             if register_commands:
                 registered_commands = self._register_commands_for_active_agent(
                     manifest, dest_dir, link_outputs=link_commands
@@ -3130,18 +3290,18 @@ class ExtensionManager:
         except Exception as exc:
             # Any failed commit must retire outputs before the original error
             # is re-raised, including errors from hook serialization.
+            rollback_errors = []
+            if registry_started:
+                try:
+                    self.registry.remove(manifest.id)
+                except Exception as error:
+                    rollback_errors.append(f"registry: {error}")
+            if hooks_started:
+                try:
+                    hook_executor.unregister_hooks(manifest.id)
+                except Exception as error:
+                    rollback_errors.append(f"hooks: {error}")
             if register_commands and generic_active and manifest.commands:
-                rollback_errors = []
-                if registry_started:
-                    try:
-                        self.registry.remove(manifest.id)
-                    except Exception as error:
-                        rollback_errors.append(f"registry: {error}")
-                if hooks_started:
-                    try:
-                        hook_executor.unregister_hooks(manifest.id)
-                    except Exception as error:
-                        rollback_errors.append(f"hooks: {error}")
                 try:
                     with changing_file(dest_dir, removal=True):
                         rollback_generic_registration()
@@ -3150,6 +3310,20 @@ class ExtensionManager:
                 if rollback_errors:
                     raise ExtensionError(
                         f"Generic registration failed ({exc}); rollback failed: "
+                        + "; ".join(rollback_errors)
+                    ) from exc
+            elif manifest.commands or registry_started or hooks_started:
+                # The native route had no equivalent rollback (#5379):
+                # rendered command/skill outputs and the package copy were
+                # left behind while the extension was not installed.
+                try:
+                    with changing_file(dest_dir, removal=True):
+                        rollback_native_registration()
+                except Exception as error:
+                    rollback_errors.append(f"artifacts: {error}")
+                if rollback_errors:
+                    raise ExtensionError(
+                        f"Install failed ({exc}); rollback failed: "
                         + "; ".join(rollback_errors)
                     ) from exc
             raise

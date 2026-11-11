@@ -22,6 +22,7 @@ from typing import Any
 from specify_cli.extensions import (
     ExtensionManifest,
     ExtensionManager,
+    HookExecutor,
 )
 
 
@@ -3677,3 +3678,86 @@ class TestExtensionSkillEdgeCases:
         assert result is True
         assert not (skills_dir / "speckit-test-ext-hello").exists()
         assert not (skills_dir / "speckit-test-ext-world").exists()
+
+
+# ===== Failed-install native rollback Tests (#5379) =====
+
+
+class TestFailedInstallNativeRollback:
+    """A failed install leaves no outputs that the attempt created (#5379).
+
+    The generic integration already rolls its outputs back; the native
+    SKILL.md route had no equivalent, so a failure after command
+    rendering (hook registration or the final registry write) left the
+    generated skill directories behind while the extension was not
+    installed.
+    """
+
+    def test_failed_install_removes_native_skill_outputs(
+        self, skills_project, extension_dir, monkeypatch
+    ):
+        """Hook failure after rendering removes skills, package, registry."""
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        monkeypatch.setattr(
+            HookExecutor,
+            "register_hooks",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("hook write failed")),
+        )
+
+        with pytest.raises(OSError, match="hook write failed"):
+            manager.install_from_directory(extension_dir, "0.1.0")
+
+        assert not manager.registry.is_installed("test-ext")
+        assert not (skills_dir / "speckit-test-ext-hello" / "SKILL.md").exists()
+        assert not (skills_dir / "speckit-test-ext-world" / "SKILL.md").exists()
+        assert not (skills_dir / "speckit-test-ext-hello").exists()
+        assert not (skills_dir / "speckit-test-ext-world").exists()
+        assert not (project_dir / ".specify/extensions/test-ext").exists()
+
+    def test_failed_registry_write_removes_native_skill_outputs(
+        self, skills_project, extension_dir, monkeypatch
+    ):
+        """Registry-write failure after rendering removes the skill outputs."""
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        monkeypatch.setattr(
+            manager.registry,
+            "add",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("registry write failed")),
+        )
+
+        with pytest.raises(OSError, match="registry write failed"):
+            manager.install_from_directory(extension_dir, "0.1.0")
+
+        assert not manager.registry.is_installed("test-ext")
+        assert not (skills_dir / "speckit-test-ext-hello" / "SKILL.md").exists()
+        assert not (skills_dir / "speckit-test-ext-world" / "SKILL.md").exists()
+        assert not (project_dir / ".specify/extensions/test-ext").exists()
+
+    def test_failed_install_preserves_preexisting_user_skill(
+        self, skills_project, extension_dir, monkeypatch
+    ):
+        """Rollback must not delete a pre-existing user skill of the same name.
+
+        The installer never overwrites an existing SKILL.md, and the
+        ownership marker is what distinguishes the attempt's outputs from
+        the user's files.
+        """
+        project_dir, skills_dir = skills_project
+        user_skill = skills_dir / "speckit-test-ext-hello" / "SKILL.md"
+        user_skill.parent.mkdir(parents=True, exist_ok=True)
+        user_skill.write_text("# My custom skill\n", encoding="utf-8")
+        manager = ExtensionManager(project_dir)
+        monkeypatch.setattr(
+            HookExecutor,
+            "register_hooks",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("hook write failed")),
+        )
+
+        with pytest.raises(OSError, match="hook write failed"):
+            manager.install_from_directory(extension_dir, "0.1.0")
+
+        assert user_skill.read_text(encoding="utf-8") == "# My custom skill\n"
+        # The other command's skill was written by the attempt: it must go.
+        assert not (skills_dir / "speckit-test-ext-world" / "SKILL.md").exists()
