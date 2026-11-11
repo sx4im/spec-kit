@@ -17,13 +17,14 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
-from specify_cli import app
+from specify_cli import app, save_init_options
 from specify_cli.extensions import (
     CompatibilityError,
     ExtensionCatalog,
     ExtensionError,
     ExtensionManager,
     ExtensionRegistry,
+    HookExecutor,
     ValidationError,
 )
 from tests.conftest import strip_ansi
@@ -1387,3 +1388,95 @@ def test_extension_install_listing_matches_registered_command_names(
     assert result.exit_code == 0, output
     assert f"• {listed} - " in output, output
     assert f"• {not_listed} - " not in output, output
+
+
+def _write_sample_extension(ext_dir: Path) -> None:
+    """Create the minimal Claude-skills extension from issue #5379."""
+    (ext_dir / "commands").mkdir(parents=True)
+    (ext_dir / "commands/run.md").write_text("---\ndescription: d\n---\nhello\n")
+    (ext_dir / "extension.yml").write_text(yaml.safe_dump({
+        "schema_version": "1.0",
+        "extension": {"id": "sample", "name": "S", "version": "1.0.0",
+                      "description": "d", "author": "t"},
+        "requires": {"speckit_version": ">=0.1.0"},
+        "provides": {"commands": [{"name": "speckit.sample.run",
+                                    "file": "commands/run.md"}]},
+        "hooks": {"after_tasks": {"command": "speckit.sample.run",
+                                  "optional": True}},
+    }))
+
+
+def _write_sample_project(project_dir: Path) -> None:
+    (project_dir / ".specify").mkdir(parents=True)
+    (project_dir / ".claude/skills").mkdir(parents=True)
+    save_init_options(project_dir, {"ai": "claude", "ai_skills": True, "script": "sh"})
+
+
+class TestExtensionAddFailedNativeRollback:
+    """A failed native install must leave no outputs behind (#5379)."""
+
+    def test_hook_failure_removes_native_skill_outputs(self, tmp_path, monkeypatch):
+        """Hook failure after command rendering leaves no SKILL.md behind."""
+        project_dir = tmp_path / "p"
+        _write_sample_project(project_dir)
+        ext_dir = tmp_path / "ext"
+        _write_sample_extension(ext_dir)
+        monkeypatch.setattr(
+            HookExecutor, "register_hooks",
+            lambda *a: (_ for _ in ()).throw(OSError("hook write failed")),
+        )
+
+        with pytest.raises(OSError):
+            ExtensionManager(project_dir).install_from_directory(ext_dir, "1.0.0")
+
+        assert not ExtensionManager(project_dir).registry.is_installed("sample")
+        assert not (project_dir / ".claude/skills/speckit-sample-run").exists()
+        assert not (project_dir / ".specify/extensions/sample").exists()
+
+    def test_registry_write_failure_removes_native_skill_outputs(
+        self, tmp_path, monkeypatch
+    ):
+        """A failure at the final registry write retires the same outputs."""
+        project_dir = tmp_path / "p"
+        _write_sample_project(project_dir)
+        ext_dir = tmp_path / "ext"
+        _write_sample_extension(ext_dir)
+
+        def _failing_add(self, extension_id, entry):
+            raise RuntimeError("registry write failed")
+
+        monkeypatch.setattr(ExtensionRegistry, "add", _failing_add)
+
+        with pytest.raises(RuntimeError, match="registry write failed"):
+            ExtensionManager(project_dir).install_from_directory(ext_dir, "1.0.0")
+
+        assert not ExtensionManager(project_dir).registry.is_installed("sample")
+        assert not (project_dir / ".claude/skills/speckit-sample-run").exists()
+        assert not (project_dir / ".specify/extensions/sample").exists()
+
+    def test_failed_add_preserves_unrelated_preexisting_files(
+        self, tmp_path, monkeypatch
+    ):
+        """Rollback removes only this attempt's outputs, not user files."""
+        project_dir = tmp_path / "p"
+        _write_sample_project(project_dir)
+        ext_dir = tmp_path / "ext"
+        _write_sample_extension(ext_dir)
+        unrelated = project_dir / ".claude/skills/speckit-other/SKILL.md"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text("---\nname: other\n---\nuser content\n", encoding="utf-8")
+        notes = project_dir / ".claude/skills/notes.md"
+        notes.write_text("my notes\n", encoding="utf-8")
+        monkeypatch.setattr(
+            HookExecutor, "register_hooks",
+            lambda *a: (_ for _ in ()).throw(OSError("hook write failed")),
+        )
+
+        with pytest.raises(OSError):
+            ExtensionManager(project_dir).install_from_directory(ext_dir, "1.0.0")
+
+        assert not (project_dir / ".claude/skills/speckit-sample-run").exists()
+        assert unrelated.read_text(encoding="utf-8") == (
+            "---\nname: other\n---\nuser content\n"
+        )
+        assert notes.read_text(encoding="utf-8") == "my notes\n"

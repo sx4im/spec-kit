@@ -3048,11 +3048,66 @@ class ExtensionManager:
             else:
                 shutil.rmtree(dest_dir)
 
+        def rollback_native_registration() -> None:
+            """Retire outputs a failed native install rendered (#5379).
+
+            Mirrors the generic rollback for the native route: command
+            artifacts are removed through the same unregister path
+            ``remove()`` uses, skill outputs only where the extension
+            ownership marker verifies them (so pre-existing user files
+            are left alone), and the copied package is retired while
+            rescued configs are preserved like the generic rollback.
+            """
+            from ..agents import CommandRegistrar
+
+            if registered_commands:
+                safe_commands = {
+                    agent: names
+                    for agent, names in registered_commands.items()
+                    if agent != "generic"
+                }
+                if safe_commands:
+                    CommandRegistrar(
+                        self.project_root, include_generic=False
+                    ).unregister_commands(safe_commands, self.project_root)
+            if registered_skills:
+                self._unregister_extension_skills(registered_skills, manifest.id)
+
+            preserved = set(stranded_configs)
+            if did_remove:
+                backup_dir = self.extensions_dir / ".backup" / manifest.id
+                if backup_dir.is_dir() and not backup_dir.is_symlink():
+                    for config_file in backup_dir.iterdir():
+                        if (
+                            config_file.is_file()
+                            and not config_file.is_symlink()
+                            and config_file.name.endswith(
+                                ("-config.yml", "-config.local.yml")
+                            )
+                        ):
+                            shutil.copy2(config_file, dest_dir / config_file.name)
+                            preserved.add(config_file.name)
+            if preserved:
+                for child in dest_dir.iterdir():
+                    if child.name in preserved:
+                        continue
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                (dest_dir / ".keep-config").write_text("", encoding="utf-8")
+            else:
+                shutil.rmtree(dest_dir)
+
         hooks_started = False
         registry_started = False
+        # Outputs this attempt rendered. Initialized before the commit block
+        # so the native rollback below can retire partial outputs even when
+        # a registration call fails midway (#5379).
+        registered_commands: Dict[str, List[str]] = {}
+        registered_skills: List[str] = []
         try:
             # Register commands with AI agents (active integration only, #2948)
-            registered_commands = {}
             if register_commands:
                 registered_commands = self._register_commands_for_active_agent(
                     manifest, dest_dir, link_outputs=link_commands
@@ -3150,6 +3205,30 @@ class ExtensionManager:
                 if rollback_errors:
                     raise ExtensionError(
                         f"Generic registration failed ({exc}); rollback failed: "
+                        + "; ".join(rollback_errors)
+                    ) from exc
+            else:
+                # Native route: retire the registry entry, hooks, and every
+                # output this attempt rendered (#5379).
+                rollback_errors = []
+                if registry_started:
+                    try:
+                        self.registry.remove(manifest.id)
+                    except Exception as error:
+                        rollback_errors.append(f"registry: {error}")
+                if hooks_started:
+                    try:
+                        hook_executor.unregister_hooks(manifest.id)
+                    except Exception as error:
+                        rollback_errors.append(f"hooks: {error}")
+                try:
+                    with changing_file(dest_dir, removal=True):
+                        rollback_native_registration()
+                except Exception as error:
+                    rollback_errors.append(f"artifacts: {error}")
+                if rollback_errors:
+                    raise ExtensionError(
+                        f"Native registration failed ({exc}); rollback failed: "
                         + "; ".join(rollback_errors)
                     ) from exc
             raise
